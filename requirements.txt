@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+firebase-admin
+apscheduler
+pydantic
