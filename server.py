@@ -20,7 +20,7 @@ SERVICE_ACCOUNT = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccou
 API_KEY = os.environ.get("API_KEY", "api-key")
 print(f"DEBUG: API_KEY is set to: {API_KEY}")
 MISSED_THRESHOLD_MS = 65 * 60 * 1000  # 65 minutes in ms
-CHECK_INTERVAL_SECONDS = 5 * 60  # 5 minutes
+CHECK_INTERVAL_SECONDS = 1 * 60  # 1 minute
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("checkin_api")
