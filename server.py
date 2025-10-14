@@ -80,6 +80,8 @@ class RegisterWatcher(BaseModel):
 class CheckinRequest(BaseModel):
     checker_id: str
     timestamp: Optional[int] = None  # epoch ms; server will set if missing
+    check_interval: Optional[int] = 60  # in minutes
+    check_window: Optional[int] = 5     # in minutes
 
 # Simple API key check decorator-like
 def require_api_key(x_api_key: str = Header(None)):
