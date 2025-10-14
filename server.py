@@ -51,9 +51,11 @@ def init_db():
     c = conn.cursor()
     c.execute("""
     CREATE TABLE IF NOT EXISTS checkins (
-      checker_id TEXT PRIMARY KEY,
-      last_checkin INTEGER DEFAULT 0,
-      missed_notified INTEGER DEFAULT 0
+    checker_id TEXT PRIMARY KEY,
+    last_checkin INTEGER DEFAULT 0,
+    missed_notified INTEGER DEFAULT 0,
+    check_interval INTEGER DEFAULT 60,
+    check_window INTEGER DEFAULT 5
     )
     """)
     c.execute("""
@@ -104,17 +106,23 @@ def checkin(payload: CheckinRequest, x_api_key: str = Header(None)):
     require_api_key(x_api_key)
     now_ms = int(time.time() * 1000)
     ts = payload.timestamp if payload.timestamp is not None else now_ms
+    interval = payload.check_interval or 60  # minutes
+    window = payload.check_window or 5       # minutes
+
     conn = get_conn()
     c = conn.cursor()
-    # Insert or update last_checkin; also reset missed_notified so server won't think it's missed
     c.execute("""
-       INSERT INTO checkins(checker_id, last_checkin, missed_notified)
-       VALUES (?, ?, 0)
-       ON CONFLICT(checker_id) DO UPDATE SET last_checkin=excluded.last_checkin, missed_notified=0
-    """, (payload.checker_id, ts))
+       INSERT INTO checkins(checker_id, last_checkin, missed_notified, check_interval, check_window)
+       VALUES (?, ?, 0, ?, ?)
+       ON CONFLICT(checker_id) DO UPDATE SET
+           last_checkin=excluded.last_checkin,
+           missed_notified=0,
+           check_interval=excluded.check_interval,
+           check_window=excluded.check_window
+    """, (payload.checker_id, ts, interval, window))
     conn.commit()
     conn.close()
-    logger.info(f"Checkin recorded for {payload.checker_id} at {ts}")
+    logger.info(f"Checkin recorded for {payload.checker_id} at {ts} (interval={interval}, window={window})")
     return {"ok": True, "timestamp": ts}
 
 @app.get("/status/{checker_id}")
@@ -151,14 +159,19 @@ def check_for_missed():
         now_ms = int(time.time() * 1000)
         conn = get_conn()
         c = conn.cursor()
-        c.execute("SELECT checker_id, last_checkin, missed_notified FROM checkins")
+        c.execute("SELECT checker_id, last_checkin, missed_notified, check_interval, check_window FROM checkins")
         rows = c.fetchall()
-        for checker_id, last_checkin, missed_notified in rows:
+        for checker_id, last_checkin, missed_notified, check_interval, check_window in rows:
             last_checkin = last_checkin or 0
             if last_checkin == 0:
-                # optionally: treat as never checked in; skip until they checkin once
-                continue
-            if (now_ms - last_checkin) >= MISSED_THRESHOLD_MS and missed_notified == 0:
+                continue  # skip users who never checked in
+
+            # --- PER-CHECKER MISSED TIME CALCULATION ---
+            interval_ms = (check_interval or 60) * 60_000  # default 60 min
+            window_ms = (check_window or 5) * 60_000       # default 5 min
+            allowed_time = interval_ms + window_ms
+
+            if (now_ms - last_checkin) >= allowed_time and missed_notified == 0:
                 # get watcher tokens
                 c2 = conn.cursor()
                 c2.execute("SELECT watcher_token FROM watchers WHERE checker_id = ?", (checker_id,))
@@ -176,6 +189,7 @@ def check_for_missed():
         conn.close()
     except Exception as e:
         logger.exception("Error in check_for_missed job: %s", e)
+
 
 # scheduler start on startup
 scheduler = BackgroundScheduler()
