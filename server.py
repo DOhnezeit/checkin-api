@@ -187,14 +187,25 @@ def status(checker_id: str):
 def send_fcm_to_tokens(tokens: List[str], title: str, body: str, data: dict = None):
     if not tokens:
         return {"success": 0, "failure": 0}
-    message = messaging.MulticastMessage(
-        notification=messaging.Notification(title=title, body=body),
-        data={k: str(v) for k, v in (data or {}).items()},
-        tokens=tokens
-    )
-    response = messaging.send_multicast(message)
-    logger.info(f"FCM send result: success={response.success_count} fail={response.failure_count}")
-    return {"success": response.success_count, "failure": response.failure_count}
+    
+    success = 0
+    failure = 0
+    
+    for token in tokens:
+        try:
+            message = messaging.Message(
+                notification=messaging.Notification(title=title, body=body),
+                data={k: str(v) for k, v in (data or {}).items()},
+                token=token
+            )
+            messaging.send(message)
+            success += 1
+        except Exception as e:
+            logger.warning(f"Failed to send to {token}: {e}")
+            failure += 1
+    
+    logger.info(f"FCM send result: success={success} fail={failure}")
+    return {"success": success, "failure": failure}
 
 # Background job: check reminders and missed check-ins
 def check_for_missed():
