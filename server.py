@@ -49,8 +49,8 @@ def init_db():
         checker_id TEXT PRIMARY KEY,
         last_checkin INTEGER DEFAULT 0,
         missed_notified INTEGER DEFAULT 0,
-        check_interval REAL DEFAULT 1,  -- in minutes, use float for testing
-        check_window REAL DEFAULT 0.5   -- in minutes
+        check_interval REAL DEFAULT 1,
+        check_window REAL DEFAULT 0.5
     )
     """)
     c.execute("""
@@ -59,6 +59,13 @@ def init_db():
         watcher_id TEXT,
         watcher_token TEXT,
         PRIMARY KEY (checker_id, watcher_id)
+    )
+    """)
+    # ADD THIS:
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS checker_tokens (
+        checker_id TEXT PRIMARY KEY,
+        token TEXT NOT NULL
     )
     """)
     conn.commit()
@@ -71,6 +78,10 @@ class RegisterWatcher(BaseModel):
     checker_id: str
     watcher_id: str
     watcher_token: str
+
+class RegisterChecker(BaseModel):
+    checker_id: str
+    checker_token: str
 
 class CheckinRequest(BaseModel):
     checker_id: str
@@ -95,6 +106,20 @@ def register_watcher(payload: RegisterWatcher, x_api_key: str = Header(None)):
     conn.commit()
     conn.close()
     logger.info(f"Registered watcher {payload.watcher_id} for {payload.checker_id}")
+    return {"ok": True}
+
+@app.post("/register_checker")
+def register_checker(payload: RegisterChecker, x_api_key: str = Header(None)):
+    require_api_key(x_api_key)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO checker_tokens (checker_id, token) VALUES (?, ?)",
+        (payload.checker_id, payload.checker_token)
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"Registered checker token for {payload.checker_id}")
     return {"ok": True}
 
 @app.post("/checkin")
@@ -189,29 +214,42 @@ def check_for_missed():
             window_ms = (check_window or 0.5) * 60_000
             elapsed = now_ms - last_checkin
 
-            # --- Soft reminder to checker ---
+            # --- Reminder to CHECKER (not watchers) ---
             if elapsed >= interval_ms and elapsed < interval_ms + window_ms:
+                # Get checker's token
                 c2 = conn.cursor()
-                c2.execute("SELECT watcher_token FROM watchers WHERE checker_id = ?", (checker_id,))
-                tokens = [r[0] for r in c2.fetchall()]
-                if tokens:
+                c2.execute("SELECT token FROM checker_tokens WHERE checker_id = ?", (checker_id,))
+                checker_row = c2.fetchone()
+                if checker_row:
+                    checker_token = checker_row[0]
                     send_fcm_to_tokens(
-                        tokens,
-                        title="Reminder: Check-in!",
-                        body=f"{checker_id}, please check in!",
+                        [checker_token],
+                        title="Time to check in!",
+                        body=f"Please check in now. You have {check_window} minutes.",
                         data={"type": "reminder", "checker_id": checker_id}
                     )
-                    logger.info(f"Reminder sent for {checker_id}")
+                    logger.info(f"Reminder sent to checker {checker_id}")
 
-            # --- Missed check-in ---
+            # --- Missed check-in (notify BOTH checker and watchers) ---
             if elapsed >= interval_ms + window_ms and missed_notified == 0:
+                # Get all tokens (checker + watchers)
+                all_tokens = []
+                
+                # Get checker token
                 c2 = conn.cursor()
+                c2.execute("SELECT token FROM checker_tokens WHERE checker_id = ?", (checker_id,))
+                checker_row = c2.fetchone()
+                if checker_row:
+                    all_tokens.append(checker_row[0])
+                
+                # Get watcher tokens
                 c2.execute("SELECT watcher_token FROM watchers WHERE checker_id = ?", (checker_id,))
-                tokens = [r[0] for r in c2.fetchall()]
-                if tokens:
+                all_tokens.extend([r[0] for r in c2.fetchall()])
+                
+                if all_tokens:
                     send_fcm_to_tokens(
-                        tokens,
-                        title="Check-in missed",
+                        all_tokens,
+                        title="Check-in missed!",
                         body=f"{checker_id} missed their check-in!",
                         data={"type": "missed", "checker_id": checker_id}
                     )
