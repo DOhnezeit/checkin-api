@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 DB_PATH = os.environ.get("DB_PATH", "checkin.db")
 SERVICE_ACCOUNT = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
 API_KEY = os.environ.get("API_KEY", "api-key")
-CHECK_INTERVAL_SECONDS = 5  # scheduler runs every 5 seconds for testing
+CHECK_INTERVAL_SECONDS = 5  # scheduler runs every 5 seconds
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("checkin_api")
@@ -50,7 +50,8 @@ def init_db():
         last_checkin INTEGER DEFAULT 0,
         missed_notified INTEGER DEFAULT 0,
         check_interval REAL DEFAULT 1,
-        check_window REAL DEFAULT 0.5
+        check_window REAL DEFAULT 0.5,
+        reminder_sent INTEGER DEFAULT 0
     )
     """)
     c.execute("""
@@ -61,7 +62,6 @@ def init_db():
         PRIMARY KEY (checker_id, watcher_id)
     )
     """)
-    # ADD THIS:
     c.execute("""
     CREATE TABLE IF NOT EXISTS checker_tokens (
         checker_id TEXT PRIMARY KEY,
@@ -85,9 +85,9 @@ class RegisterChecker(BaseModel):
 
 class CheckinRequest(BaseModel):
     checker_id: str
-    timestamp: Optional[int] = None  # epoch ms; server will set if missing
-    check_interval: Optional[float] = 1  # in minutes (float for testing)
-    check_window: Optional[float] = 0.5  # in minutes
+    timestamp: Optional[int] = None
+    check_interval: Optional[float] = 1  
+    check_window: Optional[float] = 0.5 
 
 def require_api_key(x_api_key: str = Header(None)):
     if x_api_key != API_KEY:
@@ -133,13 +133,14 @@ def checkin(payload: CheckinRequest, x_api_key: str = Header(None)):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-       INSERT INTO checkins(checker_id, last_checkin, missed_notified, check_interval, check_window)
-       VALUES (?, ?, 0, ?, ?)
-       ON CONFLICT(checker_id) DO UPDATE SET
-           last_checkin=excluded.last_checkin,
-           missed_notified=0,
-           check_interval=excluded.check_interval,
-           check_window=excluded.check_window
+    INSERT INTO checkins(checker_id, last_checkin, missed_notified, reminder_sent, check_interval, check_window)
+    VALUES (?, ?, 0, 0, ?, ?)
+    ON CONFLICT(checker_id) DO UPDATE SET
+        last_checkin=excluded.last_checkin,
+        missed_notified=0,
+        reminder_sent=0,
+        check_interval=excluded.check_interval,
+        check_window=excluded.check_window
     """, (payload.checker_id, ts, interval, window))
     conn.commit()
 
@@ -183,6 +184,28 @@ def status(checker_id: str):
         "watchers": watchers
     }
 
+@app.delete("/unregister_checker/{checker_id}")
+def unregister_checker(checker_id: str, x_api_key: str = Header(None)):
+    require_api_key(x_api_key)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM checker_tokens WHERE checker_id = ?", (checker_id,))
+    conn.commit()
+    conn.close()
+    logger.info(f"Unregistered checker token for {checker_id}")
+    return {"ok": True}
+
+@app.delete("/unregister_watcher/{checker_id}/{watcher_id}")
+def unregister_watcher(checker_id: str, watcher_id: str, x_api_key: str = Header(None)):
+    require_api_key(x_api_key)
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("DELETE FROM watchers WHERE checker_id = ? AND watcher_id = ?", (checker_id, watcher_id))
+    conn.commit()
+    conn.close()
+    logger.info(f"Unregistered watcher {watcher_id} from {checker_id}")
+    return {"ok": True}
+
 # FCM helper
 def send_fcm_to_tokens(tokens: List[str], title: str, body: str, data: dict = None):
     if not tokens:
@@ -213,10 +236,10 @@ def check_for_missed():
         now_ms = int(time.time() * 1000)
         conn = get_conn()
         c = conn.cursor()
-        c.execute("SELECT checker_id, last_checkin, missed_notified, check_interval, check_window FROM checkins")
+        c.execute("SELECT checker_id, last_checkin, missed_notified, reminder_sent, check_interval, check_window FROM checkins")
         rows = c.fetchall()
 
-        for checker_id, last_checkin, missed_notified, check_interval, check_window in rows:
+        for checker_id, last_checkin, missed_notified, reminder_sent, check_interval, check_window in rows:
             last_checkin = last_checkin or 0
             if last_checkin == 0:
                 continue
@@ -225,38 +248,35 @@ def check_for_missed():
             window_ms = (check_window or 0.5) * 60_000
             elapsed = now_ms - last_checkin
 
-            # --- Reminder to CHECKER (not watchers) ---
+            # --- Reminder to CHECKER (only once per missed cycle) ---
             if elapsed >= interval_ms and elapsed < interval_ms + window_ms:
-                # Get checker's token
-                c2 = conn.cursor()
-                c2.execute("SELECT token FROM checker_tokens WHERE checker_id = ?", (checker_id,))
-                checker_row = c2.fetchone()
-                if checker_row:
-                    checker_token = checker_row[0]
-                    send_fcm_to_tokens(
-                        [checker_token],
-                        title="Time to check in!",
-                        body=f"Please check in now. You have {check_window} minutes.",
-                        data={"type": "reminder", "checker_id": checker_id}
-                    )
-                    logger.info(f"Reminder sent to checker {checker_id}")
+                if reminder_sent == 0:
+                    c2 = conn.cursor()
+                    c2.execute("SELECT token FROM checker_tokens WHERE checker_id = ?", (checker_id,))
+                    checker_row = c2.fetchone()
+                    if checker_row:
+                        checker_token = checker_row[0]
+                        send_fcm_to_tokens(
+                            [checker_token],
+                            title="Time to check in!",
+                            body=f"Please check in now. You have {check_window} minutes.",
+                            data={"type": "reminder", "checker_id": checker_id}
+                        )
+                        logger.info(f"Reminder sent to checker {checker_id}")
+                        c.execute("UPDATE checkins SET reminder_sent = 1 WHERE checker_id = ?", (checker_id,))
+                        conn.commit()
 
-            # --- Missed check-in (notify BOTH checker and watchers) ---
+            # --- Missed check-in ---
             if elapsed >= interval_ms + window_ms and missed_notified == 0:
-                # Get all tokens (checker + watchers)
                 all_tokens = []
-                
-                # Get checker token
                 c2 = conn.cursor()
                 c2.execute("SELECT token FROM checker_tokens WHERE checker_id = ?", (checker_id,))
                 checker_row = c2.fetchone()
                 if checker_row:
                     all_tokens.append(checker_row[0])
-                
-                # Get watcher tokens
                 c2.execute("SELECT watcher_token FROM watchers WHERE checker_id = ?", (checker_id,))
                 all_tokens.extend([r[0] for r in c2.fetchall()])
-                
+
                 if all_tokens:
                     send_fcm_to_tokens(
                         all_tokens,
@@ -271,6 +291,7 @@ def check_for_missed():
         conn.close()
     except Exception as e:
         logger.exception("Error in check_for_missed job: %s", e)
+
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(check_for_missed, 'interval', seconds=CHECK_INTERVAL_SECONDS)
