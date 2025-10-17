@@ -185,10 +185,15 @@ def set_sleep(payload: SleepRequest, x_api_key: str = Header(None)):
     # Mark checker as sleeping and update timestamp
     ts = int(time.time() * 1000)
     c.execute("""
-        INSERT INTO checkins (checker_id, last_checkin, sleeping)
-        VALUES (?, ?, 1)
-        ON CONFLICT(checker_id) DO UPDATE SET last_checkin = ?, sleeping = 1
-    """, (payload.checker_id,))
+        INSERT INTO checkins (checker_id, last_checkin, sleeping, reminder_sent, missed_notified)
+        VALUES (?, ?, 1, 0, 0)
+        ON CONFLICT(checker_id) DO UPDATE SET 
+            last_checkin = ?,
+            sleeping = 1,
+            reminder_sent = 0,
+            missed_notified = 0
+    """, (payload.checker_id, ts, ts))
+    
     conn.commit()
 
     # Notify watchers
@@ -262,8 +267,11 @@ def send_fcm_to_tokens(tokens: List[str], title: str, body: str, data: dict = No
     for token in tokens:
         try:
             message = messaging.Message(
-                notification=messaging.Notification(title=title, body=body),
-                data={k: str(v) for k, v in (data or {}).items()},
+                data={
+                    "title": title,
+                    "body": body,
+                    **{k: str(v) for k, v in (data or {}).items()}
+                },
                 token=token
             )
             messaging.send(message)
@@ -285,8 +293,11 @@ def check_for_missed():
         rows = c.fetchall()
 
         for checker_id, last_checkin, missed_notified, reminder_sent, check_interval, check_window, sleeping in rows:
+            # Skip ALL checks if sleeping
             if sleeping == 1:
+                logger.debug(f"{checker_id} is sleeping — skipping all checks")
                 continue
+                
             last_checkin = last_checkin or 0
             if last_checkin == 0:
                 continue
@@ -316,11 +327,15 @@ def check_for_missed():
             # --- Missed check-in ---
             if elapsed >= interval_ms + window_ms and missed_notified == 0:
                 all_tokens = []
+
+                # Checker token
                 c2 = conn.cursor()
                 c2.execute("SELECT token FROM checker_tokens WHERE checker_id = ?", (checker_id,))
                 checker_row = c2.fetchone()
                 if checker_row:
                     all_tokens.append(checker_row[0])
+
+                # Watcher tokens
                 c2.execute("SELECT watcher_token FROM watchers WHERE checker_id = ?", (checker_id,))
                 all_tokens.extend([r[0] for r in c2.fetchall()])
 
