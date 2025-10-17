@@ -51,7 +51,8 @@ def init_db():
         missed_notified INTEGER DEFAULT 0,
         check_interval REAL DEFAULT 1,
         check_window REAL DEFAULT 0.5,
-        reminder_sent INTEGER DEFAULT 0
+        reminder_sent INTEGER DEFAULT 0,
+        sleeping INTEGER DEFAULT 0
     )
     """)
     c.execute("""
@@ -88,6 +89,9 @@ class CheckinRequest(BaseModel):
     timestamp: Optional[int] = None
     check_interval: Optional[float] = 1  
     check_window: Optional[float] = 0.5 
+
+class SleepRequest(BaseModel):
+    checker_id: str
 
 def require_api_key(x_api_key: str = Header(None)):
     if x_api_key != API_KEY:
@@ -133,14 +137,15 @@ def checkin(payload: CheckinRequest, x_api_key: str = Header(None)):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-    INSERT INTO checkins(checker_id, last_checkin, missed_notified, reminder_sent, check_interval, check_window)
-    VALUES (?, ?, 0, 0, ?, ?)
+    INSERT INTO checkins(checker_id, last_checkin, missed_notified, reminder_sent, check_interval, check_window, sleeping)
+    VALUES (?, ?, 0, 0, ?, ?, 0)
     ON CONFLICT(checker_id) DO UPDATE SET
         last_checkin=excluded.last_checkin,
         missed_notified=0,
         reminder_sent=0,
-        check_interval=excluded.check_interval,
-        check_window=excluded.check_window
+        sleeping=0,
+        check_interval=COALESCE(excluded.check_interval, checkins.check_interval),
+        check_window=COALESCE(excluded.check_window, checkins.check_window)
     """, (payload.checker_id, ts, interval, window))
     conn.commit()
 
@@ -164,11 +169,49 @@ def checkin(payload: CheckinRequest, x_api_key: str = Header(None)):
     logger.info(f"Checkin recorded for {payload.checker_id} at {ts}")
     return {"ok": True, "timestamp": ts}
 
+@app.post("/sleep")
+def set_sleep(payload: SleepRequest, x_api_key: str = Header(None)):
+    require_api_key(x_api_key)
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("SELECT sleeping FROM checkins WHERE checker_id = ?", (payload.checker_id,))
+    row = c.fetchone()
+    if row and row[0] == 1:
+        conn.close()
+        logger.info(f"{payload.checker_id} is already marked as sleeping: skipping duplicate notification.")
+        return {"ok": True, "message": "Already sleeping"}
+
+    # Mark checker as sleeping
+    c.execute("""
+        INSERT INTO checkins (checker_id, sleeping)
+        VALUES (?, 1)
+        ON CONFLICT(checker_id) DO UPDATE SET sleeping = 1
+    """, (payload.checker_id,))
+    conn.commit()
+
+    # Notify watchers
+    c.execute("SELECT watcher_token FROM watchers WHERE checker_id = ?", (payload.checker_id,))
+    tokens = [r[0] for r in c.fetchall()]
+
+    if tokens:
+        send_fcm_to_tokens(
+            tokens,
+            title="Checker asleep 💤",
+            body=f"{payload.checker_id} has gone to sleep, check-ins paused until morning.",
+            data={"type": "sleep", "checker_id": payload.checker_id}
+        )
+
+    conn.close()
+    logger.info(f"{payload.checker_id} is now marked as sleeping.")
+    return {"ok": True}
+
+
 @app.get("/status/{checker_id}")
 def status(checker_id: str):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT last_checkin, missed_notified, check_interval, check_window FROM checkins WHERE checker_id = ?", (checker_id,))
+    c.execute("SELECT last_checkin, missed_notified, check_interval, check_window, sleeping FROM checkins WHERE checker_id = ?", (checker_id,))
     row = c.fetchone()
     c.execute("SELECT watcher_id FROM watchers WHERE checker_id = ?", (checker_id,))
     watchers = [r[0] for r in c.fetchall()]
@@ -181,6 +224,7 @@ def status(checker_id: str):
         "missed_notified": bool(row[1]),
         "check_interval": row[2],
         "check_window": row[3],
+        "sleeping": bool(row[4]),
         "watchers": watchers
     }
 
@@ -236,10 +280,12 @@ def check_for_missed():
         now_ms = int(time.time() * 1000)
         conn = get_conn()
         c = conn.cursor()
-        c.execute("SELECT checker_id, last_checkin, missed_notified, reminder_sent, check_interval, check_window FROM checkins")
+        c.execute("SELECT checker_id, last_checkin, missed_notified, reminder_sent, check_interval, check_window, sleeping FROM checkins")
         rows = c.fetchall()
 
-        for checker_id, last_checkin, missed_notified, reminder_sent, check_interval, check_window in rows:
+        for checker_id, last_checkin, missed_notified, reminder_sent, check_interval, check_window, sleeping in rows:
+            if sleeping == 1:
+                continue
             last_checkin = last_checkin or 0
             if last_checkin == 0:
                 continue
