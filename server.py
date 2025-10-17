@@ -182,11 +182,12 @@ def set_sleep(payload: SleepRequest, x_api_key: str = Header(None)):
         logger.info(f"{payload.checker_id} is already marked as sleeping: skipping duplicate notification.")
         return {"ok": True, "message": "Already sleeping"}
 
-    # Mark checker as sleeping
+    # Mark checker as sleeping and update timestamp
+    ts = int(time.time() * 1000)
     c.execute("""
-        INSERT INTO checkins (checker_id, sleeping)
-        VALUES (?, 1)
-        ON CONFLICT(checker_id) DO UPDATE SET sleeping = 1
+        INSERT INTO checkins (checker_id, last_checkin, sleeping)
+        VALUES (?, ?, 1)
+        ON CONFLICT(checker_id) DO UPDATE SET last_checkin = ?, sleeping = 1
     """, (payload.checker_id,))
     conn.commit()
 
