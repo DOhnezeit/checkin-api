@@ -153,15 +153,11 @@ def checkin(payload: CheckinRequest, x_api_key: str = Header(None)):
     c.execute("SELECT watcher_token FROM watchers WHERE checker_id = ?", (payload.checker_id,))
     tokens = [r[0] for r in c.fetchall()]
     if tokens:
-        messaging.send_multicast(
-            messaging.MulticastMessage(
-                notification=messaging.Notification(
-                    title="Check-in successful",
-                    body=f"{payload.checker_id} checked in!"
-                ),
-                tokens=tokens,
-                data={"type": "checkin", "checker_id": payload.checker_id}
-            )
+        send_fcm_to_tokens(
+            tokens,
+            title="Check-in successful",
+            body=f"{payload.checker_id} checked in!",
+            data={"type": "checkin", "checker_id": payload.checker_id}
         )
         logger.info(f"Sent check-in success notification for {payload.checker_id}")
 
@@ -260,18 +256,24 @@ def unregister_watcher(checker_id: str, watcher_id: str, x_api_key: str = Header
 def send_fcm_to_tokens(tokens: List[str], title: str, body: str, data: dict = None):
     if not tokens:
         return {"success": 0, "failure": 0}
-    
+
     success = 0
     failure = 0
-    
+
     for token in tokens:
         try:
             message = messaging.Message(
-                data={
-                    "title": title,
-                    "body": body,
-                    **{k: str(v) for k, v in (data or {}).items()}
-                },
+                notification=messaging.Notification(
+                    title=title,
+                    body=body
+                ),
+                data={k: str(v) for k, v in (data or {}).items()},
+                android=messaging.AndroidConfig(
+                    priority="high",
+                    notification=messaging.AndroidNotification(
+                        channel_id="checkin_notifications"
+                    )
+                ),
                 token=token
             )
             messaging.send(message)
@@ -279,9 +281,10 @@ def send_fcm_to_tokens(tokens: List[str], title: str, body: str, data: dict = No
         except Exception as e:
             logger.warning(f"Failed to send to {token}: {e}")
             failure += 1
-    
+
     logger.info(f"FCM send result: success={success} fail={failure}")
     return {"success": success, "failure": failure}
+
 
 # Background job: check reminders and missed check-ins
 def check_for_missed():
