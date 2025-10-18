@@ -143,7 +143,7 @@ def checkin(payload: CheckinRequest, x_api_key: str = Header(None)):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-    INSERT INTO checkins(checker_id, last_checkin, missed_notified, reminder_sent, check_interval, check_window, sleeping)
+    INSERT INTO checkins(checker_id, last_checkin, missed_notified, reminder_sent, check_interval, check_window, sleeping, alarm_active, last_alarm_sent)
     VALUES (?, ?, 0, 0, ?, ?, 0, 0, 0)
     ON CONFLICT(checker_id) DO UPDATE SET
         last_checkin=excluded.last_checkin,
