@@ -18,7 +18,8 @@ DB_PATH = os.environ.get("DB_PATH", "checkin.db")
 SERVICE_ACCOUNT = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "serviceAccountKey.json")
 API_KEY = os.environ.get("API_KEY", "api-key")
 CHECK_INTERVAL_SECONDS = 5  # scheduler runs every 5 seconds
-ALARM_REPEAT_INTERVAL_SECONDS = 5 # send alarm notification every 5 seconds
+ALARM_REPEAT_INTERVAL_SECONDS = 5  # send alarm notification every 5 seconds
+ALARM_TIMEOUT_MINUTES = 30  # stop alarm after 30 minutes if not acknowledged
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("checkin_api")
@@ -41,6 +42,7 @@ firebase_admin.initialize_app(cred)
 # DB helpers
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
+
 
 def init_db():
     conn = get_conn()
@@ -75,6 +77,7 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 init_db()
 
 # Models
@@ -83,25 +86,31 @@ class RegisterWatcher(BaseModel):
     watcher_id: str
     watcher_token: str
 
+
 class RegisterChecker(BaseModel):
     checker_id: str
     checker_token: str
 
+
 class CheckinRequest(BaseModel):
     checker_id: str
     timestamp: Optional[int] = None
-    check_interval: Optional[float] = 1  
-    check_window: Optional[float] = 0.5 
+    check_interval: Optional[float] = 1
+    check_window: Optional[float] = 0.5
+
 
 class SleepRequest(BaseModel):
     checker_id: str
 
+
 class AcknowledgeAlarmRequest(BaseModel):
     checker_id: str
+
 
 def require_api_key(x_api_key: str = Header(None)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
 
 # Endpoints
 @app.post("/register_watcher")
@@ -118,6 +127,7 @@ def register_watcher(payload: RegisterWatcher, x_api_key: str = Header(None)):
     logger.info(f"Registered watcher {payload.watcher_id} for {payload.checker_id}")
     return {"ok": True}
 
+
 @app.post("/register_checker")
 def register_checker(payload: RegisterChecker, x_api_key: str = Header(None)):
     require_api_key(x_api_key)
@@ -132,11 +142,21 @@ def register_checker(payload: RegisterChecker, x_api_key: str = Header(None)):
     logger.info(f"Registered checker token for {payload.checker_id}")
     return {"ok": True}
 
+
 @app.post("/checkin")
 def checkin(payload: CheckinRequest, x_api_key: str = Header(None)):
     require_api_key(x_api_key)
     now_ms = int(time.time() * 1000)
-    ts = payload.timestamp if payload.timestamp is not None else now_ms
+
+    ts = now_ms
+
+    if payload.timestamp is not None:
+        drift_ms = now_ms - payload.timestamp
+        drift_sec = drift_ms / 1000.0
+        logger.info(f"Clock drift for {payload.checker_id}: {drift_sec:.2f}s (positive means server ahead)")
+    else:
+        drift_sec = None
+
     interval = payload.check_interval or 1
     window = payload.check_window or 0.5
 
@@ -157,7 +177,7 @@ def checkin(payload: CheckinRequest, x_api_key: str = Header(None)):
     """, (payload.checker_id, ts, interval, window))
     conn.commit()
 
-    # Notify watchers that checker successfully checked in
+    # Notify watchers
     c.execute("SELECT watcher_token FROM watchers WHERE checker_id = ?", (payload.checker_id,))
     tokens = [r[0] for r in c.fetchall()]
     if tokens:
@@ -173,20 +193,22 @@ def checkin(payload: CheckinRequest, x_api_key: str = Header(None)):
     logger.info(f"Checkin recorded for {payload.checker_id} at {ts}")
     return {"ok": True, "timestamp": ts}
 
+
 @app.post("/acknowledge_alarm")
 def acknowledge_alarm(payload: AcknowledgeAlarmRequest, x_api_key: str = Header(None)):
     require_api_key(x_api_key)
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        UPDATE checkins
-        SET alarm_active = 0, last_alarm_sent = 0
+        UPDATE checkins 
+        SET alarm_active = 0, last_alarm_sent = 0 
         WHERE checker_id = ?
     """, (payload.checker_id,))
     conn.commit()
     conn.close()
     logger.info(f"Alarm acknowledged for {payload.checker_id}")
     return {"ok": True}
+
 
 @app.post("/sleep")
 def set_sleep(payload: SleepRequest, x_api_key: str = Header(None)):
@@ -201,7 +223,6 @@ def set_sleep(payload: SleepRequest, x_api_key: str = Header(None)):
         logger.info(f"{payload.checker_id} is already marked as sleeping: skipping duplicate notification.")
         return {"ok": True, "message": "Already sleeping"}
 
-    # Mark checker as sleeping and update timestamp
     ts = int(time.time() * 1000)
     c.execute("""
         INSERT INTO checkins (checker_id, last_checkin, sleeping, reminder_sent, missed_notified, alarm_active, last_alarm_sent)
@@ -214,10 +235,8 @@ def set_sleep(payload: SleepRequest, x_api_key: str = Header(None)):
             alarm_active = 0,
             last_alarm_sent = 0
     """, (payload.checker_id, ts, ts))
-    
     conn.commit()
 
-    # Notify watchers
     c.execute("SELECT watcher_token FROM watchers WHERE checker_id = ?", (payload.checker_id,))
     tokens = [r[0] for r in c.fetchall()]
 
@@ -244,7 +263,15 @@ def status(checker_id: str):
     watchers = [r[0] for r in c.fetchall()]
     conn.close()
     if not row:
-        return {"checker_id": checker_id, "last_checkin": None, "missed_notified": None, "check_interval": 1, "check_window": 0.5, "watchers": watchers, "alarm_active": False}
+        return {
+            "checker_id": checker_id,
+            "last_checkin": None,
+            "missed_notified": None,
+            "check_interval": 1,
+            "check_window": 0.5,
+            "watchers": watchers,
+            "alarm_active": False
+        }
     return {
         "checker_id": checker_id,
         "last_checkin": row[0],
@@ -255,6 +282,7 @@ def status(checker_id: str):
         "alarm_active": bool(row[5]),
         "watchers": watchers
     }
+
 
 @app.delete("/unregister_checker/{checker_id}")
 def unregister_checker(checker_id: str, x_api_key: str = Header(None)):
@@ -267,6 +295,7 @@ def unregister_checker(checker_id: str, x_api_key: str = Header(None)):
     logger.info(f"Unregistered checker token for {checker_id}")
     return {"ok": True}
 
+
 @app.delete("/unregister_watcher/{checker_id}/{watcher_id}")
 def unregister_watcher(checker_id: str, watcher_id: str, x_api_key: str = Header(None)):
     require_api_key(x_api_key)
@@ -278,55 +307,79 @@ def unregister_watcher(checker_id: str, watcher_id: str, x_api_key: str = Header
     logger.info(f"Unregistered watcher {watcher_id} from {checker_id}")
     return {"ok": True}
 
+
 # FCM helper
 def send_fcm_to_tokens(tokens: List[str], title: str, body: str, data: dict = None):
+    """
+    Send FCM messages with notification payload to ensure onMessageReceived() is called.
+    When notification payload is present, onMessageReceived() is ALWAYS called,
+    allowing our app to create the notification with custom sounds.
+    """
     if not tokens:
         return {"success": 0, "failure": 0}
 
     success = 0
     failure = 0
 
+    notification_type = (data or {}).get("type", "checkin")
+    channel_id = {
+        "alarm": "checkin_alarms_v2",
+        "reminder": "checkin_reminders_v2",
+        "checkin": "checkin_notifications_v2",
+        "sleep": "checkin_notifications_v2"
+    }.get(notification_type, "checkin_notifications_v2")
+
     for token in tokens:
         try:
+            message_data = {
+                "title": title,
+                "body": body,
+                **{k: str(v) for k, v in (data or {}).items()}
+            }
+
             message = messaging.Message(
+                data=message_data,
                 notification=messaging.Notification(
                     title=title,
                     body=body
                 ),
-                data={**{k: str(v) for k, v in (data or {}).items()}},
                 android=messaging.AndroidConfig(
                     priority="high",
                     notification=messaging.AndroidNotification(
-                        channel_id="checkin_notifications"
+                        channel_id=channel_id,
                     )
                 ),
                 token=token
             )
-            messaging.send(message)
+            response = messaging.send(message)
+            logger.debug(f"FCM sent to {token[:20]}... on channel {channel_id}: {response}")
             success += 1
         except Exception as e:
-            logger.warning(f"Failed to send to {token}: {e}")
+            logger.warning(f"Failed to send to {token[:20]}...: {e}")
             failure += 1
 
-    logger.info(f"FCM send result: success={success} fail={failure}")
+    logger.info(f"FCM send result: success={success} fail={failure} on channel={channel_id}")
     return {"success": success, "failure": failure}
 
 
-# Background job: check reminders and missed check-ins
+# Background job
 def check_for_missed():
     try:
         now_ms = int(time.time() * 1000)
         conn = get_conn()
         c = conn.cursor()
-        c.execute("SELECT checker_id, last_checkin, missed_notified, reminder_sent, check_interval, check_window, sleeping, alarm_active, last_alarm_sent FROM checkins")
+        c.execute("""
+            SELECT checker_id, last_checkin, missed_notified, reminder_sent, 
+                   check_interval, check_window, sleeping, alarm_active, last_alarm_sent 
+            FROM checkins
+        """)
         rows = c.fetchall()
 
         for checker_id, last_checkin, missed_notified, reminder_sent, check_interval, check_window, sleeping, alarm_active, last_alarm_sent in rows:
-            # Skip ALL checks if sleeping
             if sleeping == 1:
-                logger.debug(f"{checker_id} is sleeping - skipping all checks")
+                logger.debug(f"{checker_id} is sleeping — skipping all checks")
                 continue
-                
+
             last_checkin = last_checkin or 0
             if last_checkin == 0:
                 continue
@@ -335,7 +388,7 @@ def check_for_missed():
             window_ms = (check_window or 0.5) * 60_000
             elapsed = now_ms - last_checkin
 
-            # --- Reminder to CHECKER (only once per missed cycle) ---
+            # Reminder
             if elapsed >= interval_ms and elapsed < interval_ms + window_ms:
                 if reminder_sent == 0:
                     c2 = conn.cursor()
@@ -346,52 +399,62 @@ def check_for_missed():
                         send_fcm_to_tokens(
                             [checker_token],
                             title="Time to check in!",
-                            body=f"Please check in now. You have {check_window} minutes.",
+                            body="Please check in now",
                             data={"type": "reminder", "checker_id": checker_id}
                         )
                         logger.info(f"Reminder sent to checker {checker_id}")
                         c.execute("UPDATE checkins SET reminder_sent = 1 WHERE checker_id = ?", (checker_id,))
                         conn.commit()
 
-            # --- Missed check-in: Activate alarm loop ---
-            if elapsed >= interval_ms + window_ms and missed_notified == 0:
-                all_tokens = []
-
-                # Checker token
-                c2 = conn.cursor()
-                c2.execute("SELECT token FROM checker_tokens WHERE checker_id = ?", (checker_id,))
-                checker_row = c2.fetchone()
-                if checker_row:
-                    all_tokens.append(checker_row[0])
-
-                # Watcher tokens
-                c2.execute("SELECT watcher_token FROM watchers WHERE checker_id = ?", (checker_id,))
-                all_tokens.extend([r[0] for r in c2.fetchall()])
-
-                if all_tokens:
-                    send_fcm_to_tokens(
-                        all_tokens,
-                        title="Check-in missed!",
-                        body=f"{checker_id} missed their check-in!",
-                        data={"type": "alarm", "checker_id": checker_id, "alarm_loop": "true"}
-                    )
-                    c.execute("UPDATE checkins SET missed_notified = 1, alarm_active = 1, last_alarm_sent = ? WHERE checker_id = ?", (now_ms, checker_id))
+            # Missed check-in
+            if elapsed >= interval_ms + window_ms:
+                alarm_timeout_ms = ALARM_TIMEOUT_MINUTES * 60_000
+                if alarm_active == 1 and last_alarm_sent and (now_ms - last_alarm_sent) >= alarm_timeout_ms:
+                    logger.info(f"Alarm timed out for {checker_id} after {ALARM_TIMEOUT_MINUTES} minutes")
+                    c.execute("""
+                        UPDATE checkins 
+                        SET alarm_active = 0, last_alarm_sent = 0 
+                        WHERE checker_id = ?
+                    """, (checker_id,))
                     conn.commit()
-                    logger.info(f"Alarm activated for sent for {checker_id}")
+                    continue
+
+                if missed_notified == 0:
+                    all_tokens = []
+                    c2 = conn.cursor()
+                    c2.execute("SELECT token FROM checker_tokens WHERE checker_id = ?", (checker_id,))
+                    checker_row = c2.fetchone()
+                    if checker_row:
+                        all_tokens.append(checker_row[0])
+
+                    c2.execute("SELECT watcher_token FROM watchers WHERE checker_id = ?", (checker_id,))
+                    all_tokens.extend([r[0] for r in c2.fetchall()])
+
+                    if all_tokens:
+                        send_fcm_to_tokens(
+                            all_tokens,
+                            title="⚠️ CHECK-IN MISSED!",
+                            body=f"{checker_id} missed their check-in! Tap to acknowledge.",
+                            data={"type": "alarm", "checker_id": checker_id, "alarm_loop": "true"}
+                        )
+                        c.execute("""
+                            UPDATE checkins 
+                            SET missed_notified = 1, alarm_active = 1, last_alarm_sent = ? 
+                            WHERE checker_id = ?
+                        """, (now_ms, checker_id))
+                        conn.commit()
+                        logger.info(f"Alarm activated for {checker_id}")
 
                 elif alarm_active == 1:
                     time_since_last_alarm = now_ms - (last_alarm_sent or 0)
                     if time_since_last_alarm >= ALARM_REPEAT_INTERVAL_SECONDS * 1000:
                         all_tokens = []
-
-                        # Checker token
                         c2 = conn.cursor()
                         c2.execute("SELECT token FROM checker_tokens WHERE checker_id = ?", (checker_id,))
                         checker_row = c2.fetchone()
                         if checker_row:
                             all_tokens.append(checker_row[0])
 
-                        # Watcher tokens
                         c2.execute("SELECT watcher_token FROM watchers WHERE checker_id = ?", (checker_id,))
                         all_tokens.extend([r[0] for r in c2.fetchall()])
 
@@ -408,7 +471,9 @@ def check_for_missed():
                                 WHERE checker_id = ?
                             """, (now_ms, checker_id))
                             conn.commit()
-                            logger.info(f"Repeated alarm notification for {checker_id}")
+                            logger.info(f"Repeated alarm notification for {checker_id} (time since last: {time_since_last_alarm}ms)")
+                        else:
+                            logger.warning(f"No tokens found for alarm repeat for {checker_id}")
 
         conn.close()
     except Exception as e:
@@ -418,10 +483,12 @@ def check_for_missed():
 scheduler = BackgroundScheduler()
 scheduler.add_job(check_for_missed, 'interval', seconds=CHECK_INTERVAL_SECONDS)
 
+
 @app.on_event("startup")
 def startup_event():
     logger.info("Starting scheduler...")
     scheduler.start()
+
 
 @app.on_event("shutdown")
 def shutdown_event():
